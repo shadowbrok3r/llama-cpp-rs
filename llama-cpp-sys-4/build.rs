@@ -1973,6 +1973,10 @@ fn main() {
         // Enable Ninja's parallel build with all available cores
         let parallel = std::thread::available_parallelism().unwrap().get();
         config.build_arg(format!("-j{}", parallel));
+    } else if target.contains("msvc") {
+        // The Visual Studio generator drives MSBuild, which rejects make-style -j;
+        // cmake's own --parallel (CMAKE_BUILD_PARALLEL_LEVEL) already sets the job count.
+        debug_log!("Visual Studio generator: relying on cmake --parallel");
     } else {
         // If not Ninja, explicitly set parallel jobs for Make
         let parallel = std::thread::available_parallelism().unwrap().get();
