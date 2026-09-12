@@ -163,7 +163,7 @@ pub use crate::context::{
 pub use crate::llama_backend::LlamaBackend;
 pub use crate::llama_batch::{BatchAddError, LlamaBatch};
 pub use crate::model::params::kv_overrides::ParamOverrideValue;
-pub use crate::model::params::LlamaModelParams;
+pub use crate::model::params::{LlamaModelParams, LlamaSplitMode};
 pub use crate::model::{
     AddBos, LlamaBackendDevice, LlamaBackendDeviceType, LlamaChatMessage, LlamaModel, Special,
 };

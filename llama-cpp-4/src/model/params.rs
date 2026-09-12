@@ -109,11 +109,33 @@ pub enum LlamaLazyMode {
     On = llama_cpp_sys_4::LLAMA_LAZY_MODE_ON as _,
 }
 
+/// How model weights and the KV cache are distributed across multiple GPUs
+/// (`llama_split_mode`).
+///
+/// `llama_split_mode` is an unsigned enum upstream, so each variant coerces
+/// with `as _` like [`LlamaLazyMode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum LlamaSplitMode {
+    /// Single GPU.
+    None = llama_cpp_sys_4::LLAMA_SPLIT_MODE_NONE as _,
+    /// Split layers and the KV cache across GPUs. llama.cpp's default.
+    Layer = llama_cpp_sys_4::LLAMA_SPLIT_MODE_LAYER as _,
+    /// Split layers and the KV cache across GPUs, using row-wise tensor
+    /// parallelism for the weights where the backend supports it.
+    Row = llama_cpp_sys_4::LLAMA_SPLIT_MODE_ROW as _,
+    /// Experimental tensor parallelism across GPUs.
+    Tensor = llama_cpp_sys_4::LLAMA_SPLIT_MODE_TENSOR as _,
+}
+
 /// A safe wrapper around `llama_model_params`.
 #[allow(clippy::module_name_repetitions)]
 pub struct LlamaModelParams {
     pub(crate) params: llama_cpp_sys_4::llama_model_params,
     kv_overrides: Vec<llama_cpp_sys_4::llama_model_kv_override>,
+    /// Backing storage for `params.tensor_split`; heap allocation keeps the
+    /// raw pointer valid while the builder moves.
+    tensor_split: Vec<f32>,
 }
 
 impl Debug for LlamaModelParams {
@@ -125,6 +147,8 @@ impl Debug for LlamaModelParams {
             .field("load_mode", &self.load_mode())
             .field("lazy_mode", &self.lazy_mode())
             .field("load_mtp", &self.load_mtp())
+            .field("split_mode", &self.split_mode())
+            .field("tensor_split", &self.tensor_split())
             .field("kv_overrides", &"vec of kv_overrides")
             .finish()
     }
@@ -266,6 +290,24 @@ impl LlamaModelParams {
         self.params.load_mtp
     }
 
+    /// How the model is split across GPUs.
+    #[must_use]
+    pub fn split_mode(&self) -> LlamaSplitMode {
+        match self.params.split_mode {
+            llama_cpp_sys_4::LLAMA_SPLIT_MODE_NONE => LlamaSplitMode::None,
+            llama_cpp_sys_4::LLAMA_SPLIT_MODE_ROW => LlamaSplitMode::Row,
+            llama_cpp_sys_4::LLAMA_SPLIT_MODE_TENSOR => LlamaSplitMode::Tensor,
+            _ => LlamaSplitMode::Layer,
+        }
+    }
+
+    /// Per-device proportions set by [`Self::with_tensor_split`]; empty until
+    /// one is set.
+    #[must_use]
+    pub fn tensor_split(&self) -> &[f32] {
+        &self.tensor_split
+    }
+
     /// use mmap if possible
     ///
     /// [`LlamaLoadMode::Auto`] counts as "possible": llama.cpp memory-maps under
@@ -362,6 +404,41 @@ impl LlamaModelParams {
         self
     }
 
+    /// Sets how the model is split across GPUs. Corresponds to
+    /// `llama_model_params.split_mode` (`--split-mode` in the CLI tools).
+    ///
+    /// ```
+    /// # use llama_cpp_4::model::params::{LlamaModelParams, LlamaSplitMode};
+    /// let params = LlamaModelParams::default().with_split_mode(LlamaSplitMode::Tensor);
+    /// assert_eq!(params.split_mode(), LlamaSplitMode::Tensor);
+    /// ```
+    #[must_use]
+    pub fn with_split_mode(mut self, split_mode: LlamaSplitMode) -> Self {
+        self.params.split_mode = split_mode as llama_cpp_sys_4::llama_split_mode;
+        self
+    }
+
+    /// Sets the proportion of the model offloaded to each GPU. Corresponds to
+    /// `llama_model_params.tensor_split` (`--tensor-split` in the CLI tools).
+    ///
+    /// The slice is copied into a buffer of `llama_max_devices()` entries;
+    /// extra values are ignored and missing trailing devices get `0.0`.
+    ///
+    /// ```
+    /// # use llama_cpp_4::model::params::LlamaModelParams;
+    /// let params = LlamaModelParams::default().with_tensor_split(&[48.0, 52.0]);
+    /// assert_eq!(&params.tensor_split()[..2], &[48.0, 52.0]);
+    /// ```
+    #[must_use]
+    pub fn with_tensor_split(mut self, split: &[f32]) -> Self {
+        self.tensor_split = vec![0.0; crate::max_devices()];
+        for (dst, src) in self.tensor_split.iter_mut().zip(split) {
+            *dst = *src;
+        }
+        self.params.tensor_split = self.tensor_split.as_ptr();
+        self
+    }
+
     /// sets `use_mlock`
     #[must_use]
     pub fn with_use_mlock(mut self, use_mlock: bool) -> Self {
@@ -391,6 +468,7 @@ impl Default for LlamaModelParams {
         let default_params = unsafe { llama_cpp_sys_4::llama_model_default_params() };
         LlamaModelParams {
             params: default_params,
+            tensor_split: Vec::new(),
             // push the next one to ensure we maintain the iterator invariant of ending with a 0
             kv_overrides: vec![llama_cpp_sys_4::llama_model_kv_override {
                 key: [0; 128],
