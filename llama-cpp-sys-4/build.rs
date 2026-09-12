@@ -1467,7 +1467,7 @@ fn main() {
         };
         // C++ feature flags that affect the compiled output.
         let cpp_features = format!(
-            "cuda={},metal={},vulkan={},webgpu={},blas={},opencl={},hip={},openmp={},rpc={},q1={},mtmd={},native={},shared={}",
+            "cuda={},metal={},vulkan={},webgpu={},blas={},opencl={},hip={},openmp={},rpc={},q1={},mtmd={},native={},shared={},defines={}",
             cfg!(feature = "cuda"),
             cfg!(feature = "metal"),
             cfg!(feature = "vulkan"),
@@ -1481,6 +1481,7 @@ fn main() {
             cfg!(feature = "mtmd"),
             cfg!(feature = "native"),
             build_shared_libs,
+            env::var("LLAMA_CMAKE_DEFINES").unwrap_or_default(),
         );
         let mut hasher = DefaultHasher::new();
         src_ver.hash(&mut hasher);
@@ -1786,6 +1787,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=LLAMA_PATCH_ENGINE");
     println!("cargo:rerun-if-env-changed=LLAMA_PATCH");
     println!("cargo:rerun-if-env-changed=PATCH");
+    println!("cargo:rerun-if-env-changed=LLAMA_CMAKE_DEFINES");
 
     // Rerun if prebuilt feature is toggled
     #[cfg(feature = "prebuilt")]
@@ -2434,6 +2436,11 @@ fn main() {
         config.define("GGML_RPC", "ON");
     }
 
+    // Caller-supplied CMake defines are applied last so they override the built-in ones.
+    for (key, value) in parse_cmake_defines(&env::var("LLAMA_CMAKE_DEFINES").unwrap_or_default()) {
+        config.define(&key, &value);
+    }
+
     // General
     config
         .out_dir(&cmake_out_dir)
@@ -2818,5 +2825,54 @@ fn main() {
             start_time.elapsed()
         );
         println!("cargo:warning=[BUILD] Libraries built: {:?}", llama_libs);
+    }
+}
+
+/// Parses `LLAMA_CMAKE_DEFINES` (`KEY=VALUE;KEY2=VALUE2`) into CMake defines.
+///
+/// A fragment without a `KEY=` prefix continues the previous value, so CMake
+/// list values such as `CMAKE_CUDA_ARCHITECTURES=86;89` survive the split.
+fn parse_cmake_defines(raw: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for frag in raw.split(';').map(str::trim).filter(|f| !f.is_empty()) {
+        match frag.split_once('=') {
+            Some((key, value))
+                if !key.is_empty()
+                    && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') =>
+            {
+                out.push((key.to_string(), value.to_string()));
+            }
+            _ => {
+                if let Some(last) = out.last_mut() {
+                    last.1.push(';');
+                    last.1.push_str(frag);
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod cmake_defines_tests {
+    use super::parse_cmake_defines;
+
+    #[test]
+    fn splits_pairs_and_keeps_list_values() {
+        let defines = parse_cmake_defines("A=1; CMAKE_CUDA_ARCHITECTURES=86;89 ;B=x=y;;");
+        assert_eq!(
+            defines,
+            vec![
+                ("A".to_string(), "1".to_string()),
+                ("CMAKE_CUDA_ARCHITECTURES".to_string(), "86;89".to_string()),
+                ("B".to_string(), "x=y".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_input_yields_nothing() {
+        assert!(parse_cmake_defines("").is_empty());
+        assert!(parse_cmake_defines(" ; ").is_empty());
     }
 }
