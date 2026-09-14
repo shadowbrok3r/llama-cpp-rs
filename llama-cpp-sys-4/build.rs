@@ -42,11 +42,15 @@ fn get_cargo_target_dir() -> Result<std::path::PathBuf, Box<dyn std::error::Erro
             {
                 return Ok(path);
             }
+            // `deps` sits directly under the profile directory. Custom profiles
+            // name that directory after themselves while `PROFILE` only says
+            // `debug` or `release`, so accept it when the `build` sibling exists.
             if path.file_name().is_some_and(|name| name == "deps") {
                 if let Some(parent) = path.parent() {
                     if parent
                         .file_name()
                         .is_some_and(|name| name == std::ffi::OsStr::new(&profile))
+                        || parent.join("build").is_dir()
                     {
                         return Ok(parent.to_path_buf());
                     }
@@ -55,6 +59,7 @@ fn get_cargo_target_dir() -> Result<std::path::PathBuf, Box<dyn std::error::Erro
         }
     }
 
+    // OUT_DIR is <target>/<profile dir>/build/<pkg>-<hash>/out for every profile name.
     let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
     let mut target_dir = None;
     let mut sub_path = out_dir.as_path();
@@ -62,6 +67,12 @@ fn get_cargo_target_dir() -> Result<std::path::PathBuf, Box<dyn std::error::Erro
         if parent.ends_with(&profile) {
             target_dir = Some(parent);
             break;
+        }
+        if parent.file_name().is_some_and(|name| name == "build") {
+            if let Some(profile_dir) = parent.parent() {
+                target_dir = Some(profile_dir);
+                break;
+            }
         }
         sub_path = parent;
     }
