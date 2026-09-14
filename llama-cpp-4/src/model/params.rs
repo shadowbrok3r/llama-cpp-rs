@@ -1,10 +1,10 @@
 //! A safe wrapper around `llama_model_params`.
 
 use crate::model::params::kv_overrides::KvOverrides;
-use std::ffi::{c_char, CStr};
+use std::ffi::{c_char, CStr, CString};
 use std::fmt::{Debug, Formatter};
 use std::pin::Pin;
-use std::ptr::null;
+use std::ptr::{null, null_mut};
 
 pub mod kv_overrides;
 
@@ -136,6 +136,60 @@ pub struct LlamaModelParams {
     /// Backing storage for `params.tensor_split`; heap allocation keeps the
     /// raw pointer valid while the builder moves.
     tensor_split: Vec<f32>,
+    /// Patterns behind `params.tensor_buft_overrides`; the entries below point
+    /// into these strings.
+    buft_override_patterns: Vec<CString>,
+    /// NULL-terminated override array behind `params.tensor_buft_overrides`.
+    buft_overrides: Vec<llama_cpp_sys_4::llama_model_tensor_buft_override>,
+}
+
+/// Errors from [`LlamaModelParams::with_tensor_buft_overrides`].
+#[derive(Debug, thiserror::Error)]
+pub enum TensorBuftOverrideError {
+    /// No backend device exposes a buffer type with this name.
+    #[error("unknown buffer type {name:?}; available: {available:?}")]
+    UnknownBufferType {
+        /// The requested buffer type name.
+        name: String,
+        /// The buffer type names the backend devices expose.
+        available: Vec<String>,
+    },
+    /// A pattern contains a NUL byte.
+    #[error("pattern {pattern:?} contains a NUL byte")]
+    InvalidPattern {
+        /// The rejected pattern.
+        pattern: String,
+    },
+    /// More overrides than `llama_max_tensor_buft_overrides()` allows.
+    #[error("{count} tensor buffer type overrides exceed the limit of {max}")]
+    TooMany {
+        /// Requested overrides.
+        count: usize,
+        /// Upstream limit.
+        max: usize,
+    },
+}
+
+/// Name of a buffer type, empty for NULL.
+fn buft_name(buft: llama_cpp_sys_4::ggml_backend_buffer_type_t) -> String {
+    if buft.is_null() {
+        return String::new();
+    }
+    unsafe { CStr::from_ptr(llama_cpp_sys_4::ggml_backend_buft_name(buft)) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// `(name, buffer type)` of every backend device's default buffer type.
+fn device_buffer_types() -> Vec<(String, llama_cpp_sys_4::ggml_backend_buffer_type_t)> {
+    let count = unsafe { llama_cpp_sys_4::ggml_backend_dev_count() };
+    (0..count)
+        .filter_map(|index| {
+            let device = unsafe { llama_cpp_sys_4::ggml_backend_dev_get(index) };
+            let buft = unsafe { llama_cpp_sys_4::ggml_backend_dev_buffer_type(device) };
+            (!buft.is_null()).then(|| (buft_name(buft), buft))
+        })
+        .collect()
 }
 
 impl Debug for LlamaModelParams {
@@ -149,6 +203,7 @@ impl Debug for LlamaModelParams {
             .field("load_mtp", &self.load_mtp())
             .field("split_mode", &self.split_mode())
             .field("tensor_split", &self.tensor_split())
+            .field("tensor_buft_overrides", &self.tensor_buft_overrides())
             .field("kv_overrides", &"vec of kv_overrides")
             .finish()
     }
@@ -439,6 +494,76 @@ impl LlamaModelParams {
         self
     }
 
+    /// Pins tensors whose names match a regex to a backend buffer type; the
+    /// first matching pattern wins, and `buffer_type` is a name such as `CPU`,
+    /// `CUDA0` or `CUDA1`. An empty slice clears the overrides.
+    ///
+    /// # Errors
+    ///
+    /// An unknown buffer type name, a pattern with a NUL byte, or more
+    /// overrides than [`max_tensor_buft_overrides`](crate::max_tensor_buft_overrides).
+    pub fn with_tensor_buft_overrides(
+        mut self,
+        overrides: &[(&str, &str)],
+    ) -> Result<Self, TensorBuftOverrideError> {
+        let max = crate::max_tensor_buft_overrides();
+        if overrides.len() > max {
+            return Err(TensorBuftOverrideError::TooMany {
+                count: overrides.len(),
+                max,
+            });
+        }
+        let available = device_buffer_types();
+        let mut patterns = Vec::with_capacity(overrides.len());
+        let mut entries = Vec::with_capacity(overrides.len() + 1);
+        for (pattern, buffer_type) in overrides {
+            let buft = available
+                .iter()
+                .find(|(name, _)| name == buffer_type)
+                .map(|(_, buft)| *buft)
+                .ok_or_else(|| TensorBuftOverrideError::UnknownBufferType {
+                    name: (*buffer_type).to_owned(),
+                    available: available.iter().map(|(name, _)| name.clone()).collect(),
+                })?;
+            let pattern =
+                CString::new(*pattern).map_err(|_| TensorBuftOverrideError::InvalidPattern {
+                    pattern: (*pattern).to_owned(),
+                })?;
+            entries.push(llama_cpp_sys_4::llama_model_tensor_buft_override {
+                pattern: pattern.as_ptr(),
+                buft,
+            });
+            patterns.push(pattern);
+        }
+        entries.push(llama_cpp_sys_4::llama_model_tensor_buft_override {
+            pattern: null(),
+            buft: null_mut(),
+        });
+        self.buft_override_patterns = patterns;
+        self.buft_overrides = entries;
+        self.params.tensor_buft_overrides = if overrides.is_empty() {
+            null()
+        } else {
+            self.buft_overrides.as_ptr()
+        };
+        Ok(self)
+    }
+
+    /// The configured tensor buffer type overrides as `(pattern, buffer type name)`.
+    #[must_use]
+    pub fn tensor_buft_overrides(&self) -> Vec<(String, String)> {
+        self.buft_override_patterns
+            .iter()
+            .zip(&self.buft_overrides)
+            .map(|(pattern, entry)| {
+                (
+                    pattern.to_string_lossy().into_owned(),
+                    buft_name(entry.buft),
+                )
+            })
+            .collect()
+    }
+
     /// sets `use_mlock`
     #[must_use]
     pub fn with_use_mlock(mut self, use_mlock: bool) -> Self {
@@ -469,6 +594,8 @@ impl Default for LlamaModelParams {
         LlamaModelParams {
             params: default_params,
             tensor_split: Vec::new(),
+            buft_override_patterns: Vec::new(),
+            buft_overrides: Vec::new(),
             // push the next one to ensure we maintain the iterator invariant of ending with a 0
             kv_overrides: vec![llama_cpp_sys_4::llama_model_kv_override {
                 key: [0; 128],
