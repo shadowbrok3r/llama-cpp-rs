@@ -481,6 +481,7 @@ fn stage_active_patches(patches_dir: &Path, staged_dir: &Path) -> bool {
         "0003-exact-speculative-state.patch",
         "0004-exact-decode-lifecycle-hooks.patch",
         "0005-fail-closed-eagle3-process.patch",
+        "0006-qwen4exp-mtp-pr28243.patch",
     ];
     for name in always_active {
         let source = patches_dir.join(name);
