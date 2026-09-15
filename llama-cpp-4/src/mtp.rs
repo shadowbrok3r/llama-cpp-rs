@@ -807,9 +807,9 @@ fn validate_contexts(
         required_draft,
     )
     .map_err(MtpSessionError::IncompatibleContexts)?;
-    if draft.model.n_embd_out() != target.model.n_embd() {
+    if draft.model.n_embd_out() != target.model.n_embd_out() {
         return Err(MtpSessionError::IncompatibleContexts(
-            "draft output width differs from target hidden width",
+            "draft output width differs from target output width",
         ));
     }
     Ok(())
