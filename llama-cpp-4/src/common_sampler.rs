@@ -36,7 +36,7 @@ use crate::token::LlamaToken;
 /// buffer.
 pub type CommonSamplerError = crate::shim::ShimError;
 
-use crate::shim::{check_status, last_error, read_i32s, read_string, read_tokens, Result};
+use crate::shim::{check_status, last_error, read_i32s, read_string, Result};
 
 /// Which of llama.cpp's samplers to run, and in what order.
 ///
@@ -467,18 +467,25 @@ impl CommonSampler {
         grammar_first: bool,
     ) -> Result<Vec<LlamaToken>> {
         let raw_draft: Vec<i32> = draft.iter().map(|t| t.0).collect();
-        read_tokens(|out, cap, len| unsafe {
+        // The call samples and accepts as a side effect, so it runs exactly once into a
+        // buffer that holds the longest possible result (every draft plus one sampled token).
+        let mut buf = vec![0i32; raw_draft.len() + 1];
+        let mut len: usize = 0;
+        let status = unsafe {
             sys::common_shim_sampler_sample_and_accept_n(
                 self.raw.as_ptr(),
                 ctx.context.as_ptr(),
                 raw_draft.as_ptr(),
                 raw_draft.len(),
                 grammar_first,
-                out,
-                cap,
-                len,
+                buf.as_mut_ptr(),
+                buf.len(),
+                &raw mut len,
             )
-        })
+        };
+        check_status(status)?;
+        buf.truncate(len.min(raw_draft.len() + 1));
+        Ok(buf.into_iter().map(LlamaToken).collect())
     }
 
     /// Clear all history and grammar state, keeping the configuration.
